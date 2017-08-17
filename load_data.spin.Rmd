@@ -1,0 +1,242 @@
+
+# Load data and import libraries
+
+```{r, echo=TRUE, results="hide", warning=FALSE, message=FALSE}
+library(psych)  # describe, additional statistics
+library(ROCR)  # ROC curve
+library(corrplot)  # plot correlation matrix
+
+# set working directory
+work_dir <- switch(Sys.info()[["user"]],
+             'Yarden-' = 'D:/Python_env/betting_player_response')
+stopifnot(dir.exists(work_dir))
+setwd(work_dir)
+
+# set file names and paths
+data_dir <- 'data'
+output_dir <- 'outputs'
+utils_dir <- 'utils'
+raw_data_fname <- 'class_prob_data.RData'
+raw_data_path <- file.path(data_dir, raw_data_fname)
+
+load(raw_data_path)  # loaded as DATA_1
+```
+
+```{r, echo=TRUE}
+# some basic descriptives
+str(DATA_1)
+```
+
+It seems that we have some factors that are encoded as ints.
+
+We also have a stime variable, `TimeStamp`.
+
+
+```{r, echo=TRUE}
+#### descriptive statisttics ####
+# change types to factors
+factor_column_names <- c('PlatformID', 'GameID', 'IND_USER_ID')
+for (column in factor_column_names){
+  DATA_1[, column] <- as.factor(DATA_1[, column])
+}
+
+# look for missing values => none found
+DATA_1[!complete.cases(DATA_1),]
+
+# have a look again (visualization is not straight forward)
+summary(DATA_1)
+str(DATA_1)
+describe(DATA_1[, names(DATA_1) != 'TimeStamp'])  # exclude time var
+
+```
+
+We see that there are no missing values!
+
+For monetary variables, we see very high skew and fat tails (kurtosis).
+This is, however, unsurprising, since those do not follow a Gaussian distribution (e.g. only positive).
+
+# Visualization
+
+Visualizations are generally infeasible, due to the size of the data. We will visualize the correlation martix.
+
+We see that `Startbalance` and `EndBalance` are strongly correlated, as expected.
+
+We see further that `MBetsAmoun`t is correlated with both `Startbalance` and `EndBalance`.
+
+```{r, echo=TRUE, results="hide", warning=FALSE, message=FALSE}
+#### visualize correlations plot, save to file ####
+cor_matrix <- cor(DATA_1[, !names(DATA_1) %in% c(factor_column_names, 'TimeStamp', 'LABELS')])
+pdf(file.path(output_dir, 'corr_plot.pdf'))
+corrplot(cor_matrix,
+         type = "upper", order = "hclust", 
+         tl.col = "black", tl.srt = 45)
+dev.off()
+```
+
+```{r, echo=TRUE}
+corrplot(cor_matrix,
+         type = "upper", order = "hclust", 
+         tl.col = "black", tl.srt = 45)
+```
+
+# Test-train split
+
+Ideally, I would like to perform cross validation.
+However, the sheer size of the data is not forgiving on my poor laptop.
+Therefore, I resort to test-train split.
+
+```{r, echo=TRUE}
+#### test-train split ####
+test_split_ratio <- 0.2
+n_rows <- nrow(DATA_1)
+train_sample_size <- floor((1-test_split_ratio)*n_rows)
+## set seed for partition reproductibility
+set.seed(42)
+train_ind <- sample(seq_len(n_rows), 
+                    size=train_sample_size)
+
+train_set <- DATA_1[train_ind, ]
+test_set <- DATA_1[-train_ind, ]
+```
+
+## Base-line logistic regression
+
+Next, run logistic regression on a few variable, as a base-line.
+These are only a handful, as this is trained locally (otherwise I run into memory issues).
+
+```{r, echo=TRUE}
+#### logistic regression on the basic model ####
+fit <- glm(LABELS ~ Time_from_first_spin_seconds + Startbalance + MBetsAmount + V_1, 
+           data=train_set, 
+           family=binomial(link='logit'))
+
+summary(fit)
+
+fit_results <- predict(fit, type='response', 
+                       newdata=test_set)
+fit_results <- ifelse(fit_results > 0.5,1,0)
+
+accuracy <- mean(fit_results == DATA_1$LABELS)
+print(paste('Accuracy:',round(accuracy, 3)))
+```
+
+# Feature extraction
+
+I then proceed to feature extraction.
+
+These features are hand picked, in a somewhat arbitrary manner.
+
+I created a weekday and hour factor. Possibly players act differently throughout the day and in different days.
+
+I defined a `gift` variable as `EndBalance - Startbalance + MBetsAmount - MWInsAmount`.
+Whenever `EndBalance = Startbalance - MBetsAmount + MWinsAmount` does not hold, there is some external interference.
+I defined it as the `gift` variable.
+
+The `MBetsAmount` variable is normalized to the magnitude of `Startbalance`.
+
+A new variable, `log_Startbalance`, is created, as it is plausible to hypothesize
+that a player's sensetivity to the balance is decreasing non-linearly.
+
+```{r, echo=TRUE}
+#### feature extraction ####
+# get the weekday
+DATA_1$weekdays <- as.factor(weekdays(DATA_1$TimeStamp))
+# get the (decimal) hour
+DATA_1$hour <- as.factor(format(DATA_1$TimeStamp,'%H'))
+# we should *usually* get: EndBalance=Startbalance - MBetsAmount+MWinsAmount
+# therefore, we can define the differences as "gifts"
+DATA_1$gift <- with(DATA_1, EndBalance - Startbalance + MBetsAmount - MWInsAmount)
+DATA_1$gift <- with(DATA_1, gift / Startbalance)
+# possibly useful variables, normalizing "monetary" variables
+DATA_1$MBetsAmount <- with(DATA_1, MBetsAmount / Startbalance)
+DATA_1$log_Startbalance <- log(DATA_1$Startbalance)
+
+# allocate test-train again
+train_set <- DATA_1[train_ind, ]
+test_set <- DATA_1[-train_ind, ]
+all(names(DATA_1) == names(test_set))
+```
+
+```{r, echo=TRUE}
+describe(DATA_1$gift)  # very skewed, even after normalizing for start balance
+```
+
+# Forward selection, based on AIC
+
+As mentioned before, computing power is a real limitng force here.
+
+Therefore, I limit the search here to 3 steps, i.e. a forward search of only 3 variables.
+Any more and I run out of memory!
+Had I was not limited by this factor, there are many more interesting interactions to explore, 
+such as interactions between `GameID`, `PlatformID`, `IND_USER_ID`, `weekdays`, `hour` and the numeric variables.
+
+I also omitted some of the balance variables from the search, due to the 
+multi-colinearity in the data.
+
+```{r, echo=TRUE}
+#### forward selection ####
+fit_forward <- glm(LABELS ~ 1, 
+                   data=train_set, 
+                   family=binomial(link='logit'))
+
+step(fit_forward, 
+     direction='forward',
+     steps=3,  # up to *steps* variables
+     scope=~ GameID * (Time_from_first_spin_seconds + log_Startbalance
+             + MBetsAmount + MWInsAmount + gift + V_1 + weekdays + hour))
+
+```
+
+# Choose model
+
+The model that achieved the minimal AIC, of the models search, is:
+
+`LABELS ~ Time_from_first_spin_seconds + hour + GameID`
+
+Results are not impressive, as we are no way near exhausting the potential of the data.
+I am, however, forced to stop due to very limited computing power.
+
+```{r, echo=TRUE}
+## chosen model formula
+form <- LABELS ~ Time_from_first_spin_seconds + hour + GameID
+fit_select <- glm(form, 
+                  data=DATA_1, family=binomial(link='logit'))
+
+fit_results <- predict(fit_select, type='response')
+fit_results <- ifelse(fit_results > 0.5,1,0)
+
+accuracy <- mean(fit_results == DATA_1$LABELS)
+print(paste('Accuracy:', round(accuracy, 3)))
+```
+
+# ROC analysis
+
+We see even more evidence for poor performance.
+
+```{r, echo=TRUE, results="hide", warning=FALSE, message=FALSE}
+#### ROC analysis ####
+p <- predict(fit_select, type="response")
+pr <- prediction(p, DATA_1$LABELS)
+prf <- performance(pr, measure = "tpr", x.measure = "fpr")
+# plot ROC, save to file
+pdf(file.path(output_dir, 'roc.pdf'))
+plot(prf)
+abline(a=0, b= 1)
+dev.off()
+```
+
+```{r, echo=TRUE}
+plot(prf)
+abline(a=0, b= 1)
+# calculate AUC metric
+auc <- performance(pr, measure = "auc")
+auc <- auc@y.values[[1]]
+print(paste('AUC (Area Under the Curve):', round(auc, 3)))
+```
+
+
+---
+title: "Logistic regression - player's bets"
+author: "jraiskin"
+date: "Thu Aug 17 16:14:08 2017"
+---
